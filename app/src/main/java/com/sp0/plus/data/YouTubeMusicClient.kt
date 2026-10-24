@@ -32,6 +32,127 @@ object YouTubeMusicClient {
     )
 
     // Clients that return direct (un-ciphered) stream URLs, tried in order.
+    @Volatile private var cachedCookies: String? = null
+    @Volatile private var cachedSts: Int = 20746
+    @Volatile private var cachedVisitorData: String? = null
+    @Volatile private var lastSessionTimestamp: Long = 0L
+
+    private fun refreshSession(videoId: String = ""): Boolean {
+        val vid = videoId.ifBlank { "G1XrlgTOTjo" }
+        val url = "https://www.youtube.com/watch?v=$vid&bpctr=9999999999&has_verified=1"
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", NetworkModule.UA_WEB)
+            .header("Cookie", "PREF=hl=en&tz=UTC; SOCS=CAI")
+            .build()
+
+        return try {
+            NetworkModule.apiClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return false
+
+                val setCookies = resp.headers("Set-Cookie")
+                val cookieMap = mutableMapOf<String, String>()
+                cookieMap["PREF"] = "hl=en&tz=UTC"
+                cookieMap["SOCS"] = "CAI"
+                for (sc in setCookies) {
+                    val pair = sc.substringBefore(";").trim()
+                    val eq = pair.indexOf('=')
+                    if (eq > 0) {
+                        cookieMap[pair.substring(0, eq).trim()] = pair.substring(eq + 1).trim()
+                    }
+                }
+                cachedCookies = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
+
+                val html = resp.body?.string().orEmpty()
+                val stsMatch = Regex("\"STS\":\\s*(\\d+)").find(html)
+                if (stsMatch != null) {
+                    cachedSts = stsMatch.groupValues[1].toIntOrNull() ?: 20746
+                }
+                val visMatch = Regex("\"VISITOR_DATA\":\\s*\"([^\"]+)\"").find(html)
+                if (visMatch != null) {
+                    val v = visMatch.groupValues[1]
+                    cachedVisitorData = v
+                    SettingsManager.setVisitorData(v)
+                }
+                lastSessionTimestamp = System.currentTimeMillis()
+                true
+            }
+        } catch (e: Throwable) {
+            android.util.Log.w("YouTubeMusicClient", "refreshSession failed: ${e.message}")
+            false
+        }
+    }
+
+    private fun resolveVisionOsStreamUrl(videoId: String): String? {
+        if (cachedCookies == null || (System.currentTimeMillis() - lastSessionTimestamp > 6 * 3600 * 1000L)) {
+            refreshSession(videoId)
+        }
+
+        fun executeCall(): Pair<String?, String?> {
+            val clientObj = JSONObject().apply {
+                put("clientName", "VISIONOS")
+                put("clientVersion", "1.02")
+                put("deviceMake", "Apple")
+                put("deviceModel", "RealityDevice17,1")
+                put("userAgent", NetworkModule.UA_VISIONOS)
+                put("osName", "visionOS")
+                put("osVersion", "26.5.23O471")
+                put("hl", "en")
+                put("timeZone", "UTC")
+                put("utcOffsetMinutes", 0)
+            }
+            val playbackContext = JSONObject().apply {
+                put("contentPlaybackContext", JSONObject().apply {
+                    put("html5Preference", "HTML5_PREF_WANTS")
+                    put("signatureTimestamp", cachedSts)
+                })
+            }
+            val body = JSONObject().apply {
+                put("context", JSONObject().put("client", clientObj))
+                put("videoId", videoId)
+                put("playbackContext", playbackContext)
+                put("contentCheckOk", true)
+                put("racyCheckOk", true)
+            }
+
+            val reqBuilder = Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .post(body.toString().toRequestBody(JSON))
+                .header("Content-Type", "application/json")
+                .header("User-Agent", NetworkModule.UA_VISIONOS)
+                .header("X-Youtube-Client-Name", "101")
+                .header("X-Youtube-Client-Version", "1.02")
+                .header("Origin", "https://www.youtube.com")
+
+            cachedCookies?.let { reqBuilder.header("Cookie", it) }
+            cachedVisitorData?.let { reqBuilder.header("X-Goog-Visitor-Id", it) }
+
+            try {
+                NetworkModule.apiClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    if (!resp.isSuccessful) return Pair(null, "HTTP ${resp.code}")
+                    val json = JSONObject(resp.body?.string().orEmpty())
+                    val status = json.optJSONObject("playabilityStatus")?.optString("status")
+                    if (status != "OK") {
+                        return Pair(null, status)
+                    }
+                    val url = pickAudioUrl(json)
+                    return Pair(url, null)
+                }
+            } catch (e: Throwable) {
+                return Pair(null, e.message)
+            }
+        }
+
+        var (url, err) = executeCall()
+        if (url == null) {
+            android.util.Log.w("YouTubeMusicClient", "VisionOS call failed ($err), refreshing session...")
+            if (refreshSession(videoId)) {
+                url = executeCall().first
+            }
+        }
+        return url
+    }
+
     // iOS and iPadOS clients provide reliable, unthrottled, unciphered audio stream URLs.
     private val playerClients = listOf(
         PlayerClient(
@@ -282,6 +403,18 @@ object YouTubeMusicClient {
     /** Resolves a direct audio URL for [videoId], or null if every client fails. */
     suspend fun resolveStreamUrl(videoId: String): String? = withContext(Dispatchers.IO) {
         if (videoId.isBlank()) return@withContext null
+
+        // Priority 1: VisionOS 2-step direct unciphered audio stream
+        try {
+            val vStream = resolveVisionOsStreamUrl(videoId)
+            if (!vStream.isNullOrBlank()) {
+                return@withContext vStream
+            }
+        } catch (e: Throwable) {
+            android.util.Log.w("YouTubeMusicClient", "resolveVisionOsStreamUrl failed: ${e.message}")
+        }
+
+        // Priority 2: Fallback player clients
         var visitor = try { ensureVisitorData() } catch (_: Throwable) { "" }
         if (visitor.isBlank()) {
             visitor = fetchVisitorData().orEmpty()
@@ -378,12 +511,22 @@ object YouTubeMusicClient {
             val f = formats.getJSONObject(i)
             val mime = f.optString("mimeType")
             if (!mime.startsWith("audio/") || !f.has("url")) continue
-            // Prefer AAC/MP4 (widest ExoPlayer support), then highest bitrate.
-            val score = f.optInt("bitrate") + if (mime.startsWith("audio/mp4")) 1_000_000 else 0
-            val bestScore = best?.let { it.optInt("bitrate") + if (it.optString("mimeType").startsWith("audio/mp4")) 1_000_000 else 0 } ?: -1
+            val itag = f.optInt("itag")
+            // Prefer AAC/MP4 itag 140 (widest ExoPlayer native support), then highest bitrate.
+            val score = f.optInt("bitrate") + (if (itag == 140) 10_000_000 else if (mime.startsWith("audio/mp4")) 2_000_000 else 0)
+            val bestScore = best?.let {
+                val bItag = it.optInt("itag")
+                it.optInt("bitrate") + (if (bItag == 140) 10_000_000 else if (it.optString("mimeType").startsWith("audio/mp4")) 2_000_000 else 0)
+            } ?: -1
             if (score > bestScore) best = f
         }
-        return best?.optString("url")
+        val bestUrl = best?.optString("url")
+        if (!bestUrl.isNullOrBlank()) return bestUrl
+
+        val hls = streaming.optString("hlsManifestUrl")
+        if (hls.isNotBlank()) return hls
+
+        return null
     }
 
     private fun parseSearch(root: JSONObject): List<SongsModel> {

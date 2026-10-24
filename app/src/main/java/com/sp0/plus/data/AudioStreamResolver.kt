@@ -129,11 +129,19 @@ object AudioStreamResolver {
 
             for (i in 0 until results.length()) {
                 val item = results.optJSONObject(i) ?: continue
-                val saavnTitle = item.optString("song", "")
-                val saavnSingers = item.optString("singers", "") + " " + item.optString("primary_artists", "")
+                val saavnTitle = item.optString("song").takeIf { it.isNotBlank() }
+                    ?: item.optString("title", "")
+                val moreInfo = item.optJSONObject("more_info")
+                val saavnSingers = listOfNotNull(
+                    item.optString("singers").takeIf { it.isNotBlank() },
+                    item.optString("primary_artists").takeIf { it.isNotBlank() },
+                    item.optString("subtitle").takeIf { it.isNotBlank() },
+                    moreInfo?.optString("music")?.takeIf { it.isNotBlank() }
+                ).joinToString(" ")
 
                 if (isStrictMatch(title, artist, saavnTitle, saavnSingers)) {
-                    val encrypted = item.optString("encrypted_media_url")
+                    val encrypted = item.optString("encrypted_media_url").takeIf { it.isNotBlank() }
+                        ?: moreInfo?.optString("encrypted_media_url").orEmpty()
                     if (encrypted.isNotBlank()) {
                         val decrypted = decryptMediaUrl(encrypted, prefer320)
                         if (!decrypted.isNullOrBlank()) {
@@ -217,7 +225,8 @@ object AudioStreamResolver {
 
             val json = JSONObject(body)
             val songObj = json.optJSONObject(songId) ?: return null
-            val encrypted = songObj.optString("encrypted_media_url")
+            val encrypted = songObj.optString("encrypted_media_url").takeIf { it.isNotBlank() }
+                ?: songObj.optJSONObject("more_info")?.optString("encrypted_media_url").orEmpty()
             if (encrypted.isNotBlank()) {
                 decryptMediaUrl(encrypted, prefer320)
             } else {

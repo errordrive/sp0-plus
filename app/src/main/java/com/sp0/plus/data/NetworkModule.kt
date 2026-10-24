@@ -23,6 +23,8 @@ object NetworkModule {
         "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)"
     private const val UA_ANDROID_VR =
         "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+    const val UA_VISIONOS =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
     const val UA_WEB =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
 
@@ -93,10 +95,11 @@ object NetworkModule {
                 val isGoogleVideo = req.url.host.contains("googlevideo.com")
                 val cParam = req.url.queryParameter("c")
                 val ua = when (cParam) {
+                    "VISIONOS" -> UA_VISIONOS
                     "ANDROID_MUSIC" -> UA_ANDROID_MUSIC
                     "ANDROID_VR" -> UA_ANDROID_VR
                     "IOS" -> UA_IOS
-                    else -> if (isGoogleVideo) UA_IOS else "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+                    else -> if (isGoogleVideo) UA_VISIONOS else UA_WEB
                 }
                 chain.proceed(req.newBuilder().header("User-Agent", ua).build())
             }
